@@ -1,3 +1,4 @@
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence, PackedSequence
 from ..torch_core import *
 from ..layers import *
 
@@ -73,6 +74,7 @@ def _repackage_var(h:Tensors) -> Tensors:
     "Detach h from its history."
     return h.detach() if type(h) == torch.Tensor else tuple(_repackage_var(v) for v in h)
 
+
 class RNNCore(nn.Module):
     "AWD-LSTM/QRNN inspired by https://arxiv.org/abs/1708.02182."
 
@@ -83,7 +85,7 @@ class RNNCore(nn.Module):
 
         super().__init__()
         self.bs,self.qrnn,self.ndir = 1, qrnn,(2 if bidir else 1)
-        self.emb_sz,self.n_hid,self.n_layers = emb_sz,n_hid,n_layers
+        self.emb_sz,self.n_hid,self.n_layers,self.pad_token = emb_sz,n_hid,n_layers,pad_token
         self.encoder = nn.Embedding(vocab_sz, emb_sz, padding_idx=pad_token)
         self.encoder_dp = EmbeddingDropout(self.encoder, embed_p)
         if self.qrnn:
@@ -104,15 +106,29 @@ class RNNCore(nn.Module):
         self.input_dp = RNNDropout(input_p)
         self.hidden_dps = nn.ModuleList([RNNDropout(hidden_p) for l in range(n_layers)])
 
-    def forward(self, input:LongTensor) -> Tuple[Tensor,Tensor]:
-        sl,bs = input.size()
-        if bs!=self.bs:
-            self.bs=bs
+    def forward(self, input) -> Tuple[Tensor,Tensor]:
+        if is_listy(input):
+            input, lengths = input
+        else: # assuming input is a Tensor
+            sl, bs = input.size()
+            lengths = torch.LongTensor([sl] * bs)
+
+        # pack_padded can not handle zero lengths texts
+        empty_inputs = np.argwhere(lengths <= 0)
+        lengths[empty_inputs] = 1
+
+        sl, bs = input.size()
+        if bs != self.bs:
+            self.bs = bs
             self.reset()
+
         raw_output = self.input_dp(self.encoder_dp(input))
-        new_hidden,raw_outputs,outputs = [],[],[]
-        for l, (rnn,hid_dp) in enumerate(zip(self.rnns, self.hidden_dps)):
-            raw_output, new_h = rnn(raw_output, self.hidden[l])
+        new_hidden, raw_outputs, outputs = [], [], []
+        for l, (rnn, hid_dp) in enumerate(zip(self.rnns, self.hidden_dps)):
+
+            packed_rnn_inp = pack_padded_sequence(raw_output, lengths)
+            rnn_output, new_h = rnn(packed_rnn_inp, self.hidden[l])
+            raw_output, _ = pad_packed_sequence(rnn_output)
             new_hidden.append(new_h)
             raw_outputs.append(raw_output)
             if l != self.n_layers - 1: raw_output = hid_dp(raw_output)
@@ -169,15 +185,26 @@ class MultiBatchRNNCore(RNNCore):
         return [torch.cat([l[si] for l in arrs]) for si in range_of(arrs[0])]
 
     def forward(self, input:LongTensor) -> Tuple[Tensor,Tensor]:
+        if isinstance(input, PackedSequence):
+            input, lengths = pad_packed_sequence(input)
+        elif isinstance(input, Tensor):
+            sl, bs = input.size()
+            lengths = torch.LongTensor([sl] * bs)
+        else:
+            input, lengths = pad_sequence(input), torch.LongTensor([v.size(0) for v in input])
+
         sl,bs = input.size()
+        shortest_len = int(lengths[-1])
+        collect_thres = max(shortest_len-self.max_seq, 0)
+
         self.reset()
         raw_outputs, outputs = [],[]
         for i in range(0, sl, self.bptt):
-            r, o = super().forward(input[i: min(i+self.bptt, sl)])
-            if i>(sl-self.max_seq):
+            r, o = super().forward((input[i: min(i+self.bptt, sl)], np.minimum(lengths - i, self.bptt)))
+            if i >= collect_thres:
                 raw_outputs.append(r)
                 outputs.append(o)
-        return self.concat(raw_outputs), self.concat(outputs)
+        return self.concat(raw_outputs), self.concat(outputs), lengths
 
 class PoolingLinearClassifier(nn.Module):
     "Create a linear classifier with pooling."
@@ -190,18 +217,27 @@ class PoolingLinearClassifier(nn.Module):
             mod_layers += bn_drop_lin(n_in, n_out, p=p, actn=actn)
         self.layers = nn.Sequential(*mod_layers)
 
-    def pool(self, x:Tensor, bs:int, is_max:bool):
-        "Pool the tensor along the seq_len dimension."
-        f = F.adaptive_max_pool1d if is_max else F.adaptive_avg_pool1d
-        return f(x.permute(1,2,0), (1,)).view(bs,-1)
+    def avg_pool(self, x:Tensor, lengths:LongTensor):
+        diffs_from_max = lengths[0] - lengths
+        batch_lengths = np.minimum(x.size(0) - diffs_from_max, lengths)
+        return torch.div(torch.sum(x, dim=0).permute(1, 0), to_device(batch_lengths.float(), None)).permute(1, 0)
 
-    def forward(self, input:Tuple[Tensor,Tensor]) -> Tuple[Tensor,Tensor,Tensor]:
-        raw_outputs, outputs = input
+    def max_pool(self, x:Tensor, bs:int):
+        "Pool the tensor along the seq_len dimension."
+        return F.adaptive_max_pool1d(x.permute(1,2,0), (1,)).view(bs,-1)
+
+    def last_output(self, outputs:Tensor, lengths:Collection[float]):
+        diffs_from_max = lengths[0] - lengths
+        batch_lengths = outputs.size(0) - diffs_from_max
+        return outputs[batch_lengths - 1, np.arange(outputs.shape[1]), :]
+
+    def forward(self, input:Tuple[Tensor,Tensor, LongTensor]) -> Tuple[Tensor,Tensor,Tensor]:
+        raw_outputs, outputs, lengths = input
         output = outputs[-1]
         sl,bs,_ = output.size()
-        avgpool = self.pool(output, bs, False)
-        mxpool = self.pool(output, bs, True)
-        x = torch.cat([output[-1], mxpool, avgpool], 1)
+        avgpool = self.avg_pool(output, lengths)
+        mxpool = self.max_pool(output, bs)
+        x = torch.cat([self.last_output(outputs[-1], lengths), mxpool, avgpool], 1)
         x = self.layers(x)
         return x, raw_outputs, outputs
 

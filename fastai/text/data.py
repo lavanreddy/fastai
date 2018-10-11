@@ -1,10 +1,11 @@
 "NLP data loading pipeline. Supports csv, folders, and preprocessed data."
+
 from ..torch_core import *
 from .transform import *
 from ..data import *
 
 __all__ = ['LanguageModelLoader', 'SortSampler', 'SortishSampler', 'TextDataset', 'TextMtd', 'classifier_data', 'lm_data',
-           'pad_collate', 'read_classes', 'standard_data', 'text_data_from_df',  'text_data_from_csv',
+           'simple_collate', 'read_classes', 'standard_data', 'text_data_from_df',  'text_data_from_csv',
             'text_data_from_folder', 'text_data_from_ids', 'text_data_from_tokens']
 
 TextMtd = IntEnum('TextMtd', 'DF CSV TOK IDS')
@@ -260,16 +261,15 @@ class SortishSampler(Sampler):
         ck_idx = [sort_idx[i:i+sz] for i in range(0, len(sort_idx), sz)]
         max_ck = np.argmax([self.key(ck[0]) for ck in ck_idx])  # find the chunk with the largest key,
         ck_idx[0],ck_idx[max_ck] = ck_idx[max_ck],ck_idx[0]     # then make sure it goes first.
-        sort_idx = np.concatenate(np.random.permutation(ck_idx[1:]))
-        sort_idx = np.concatenate((ck_idx[0], sort_idx))
+        sort_idx = np.concatenate(np.random.permutation(ck_idx[1:-1]))
+        sort_idx = np.concatenate((ck_idx[0], sort_idx, ck_idx[-1]))
         return iter(sort_idx)
 
-def pad_collate(samples:BatchSamples, pad_idx:int=1, pad_first:bool=True) -> Tuple[LongTensor, LongTensor]:
-    "Function that collect samples and adds padding."
-    max_len = max([len(s[0]) for s in samples])
-    res = torch.zeros(max_len, len(samples)).long() + pad_idx
-    for i,s in enumerate(samples): res[-len(s[0]):,i] = LongTensor(s[0])
-    return res, torch.tensor([s[1] for s in samples]).squeeze()
+def simple_collate(samples:BatchSamples) -> Tuple[LongTensor, LongTensor]:
+    "Function that collect samples."
+    ys = torch.tensor(np.array([s[1] for s in samples])).squeeze()
+    xs = [torch.tensor(s[0]) for s in samples]
+    return (xs, ), ys
 
 DataFunc = Callable[[Collection[DatasetBase], PathOrStr, KWArgs], DataBunch]
 fastai_types[DataFunc] = 'DataFunc'
@@ -288,11 +288,11 @@ def classifier_data(datasets:Collection[TextDataset], path:PathOrStr, **kwargs) 
     bs = kwargs.pop('bs') if 'bs' in kwargs else 64
     pad_idx = kwargs.pop('pad_idx') if 'pad_idx' in kwargs else 1
     train_sampler = SortishSampler(datasets[0].ids, key=lambda x: len(datasets[0].ids[x]), bs=bs//2)
-    train_dl = DeviceDataLoader.create(datasets[0], bs//2, sampler=train_sampler, collate_fn=pad_collate)
+    train_dl = DeviceDataLoader.create(datasets[0], bs//2, sampler=train_sampler, collate_fn=simple_collate)
     dataloaders = [train_dl]
     for ds in datasets[1:]:
         sampler = SortSampler(ds.ids, key=lambda x: len(ds.ids[x]))
-        dataloaders.append(DeviceDataLoader.create(ds, bs,  sampler=sampler, collate_fn=pad_collate))
+        dataloaders.append(DeviceDataLoader.create(ds, bs,  sampler=sampler, collate_fn=simple_collate))
     return DataBunch(*dataloaders, path=path)
 
 def text_data_from_ids(path:PathOrStr, train:str='train', valid:str='valid', test:Optional[str]=None,
